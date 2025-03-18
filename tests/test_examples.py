@@ -36,9 +36,9 @@ from pydantic_ai.models.test import TestModel
 from .conftest import ClientWithHandler, TestEnv
 
 try:
-    from pydantic_ai.models.vertexai import VertexAIModel
+    from pydantic_ai.providers.google_vertex import GoogleVertexProvider
 except ImportError:
-    VertexAIModel = None
+    GoogleVertexProvider = None
 
 
 try:
@@ -47,7 +47,9 @@ except ImportError:
     logfire = None
 
 
-pytestmark = pytest.mark.skipif(VertexAIModel is None or logfire is None, reason='google-auth or logfire not installed')
+pytestmark = pytest.mark.skipif(
+    GoogleVertexProvider is None or logfire is None, reason='google-auth or logfire not installed'
+)
 
 
 def find_filter_examples() -> Iterable[CodeExample]:
@@ -75,6 +77,10 @@ def test_docs_examples(
     mocker.patch('httpx.AsyncClient.post', side_effect=async_http_request)
     mocker.patch('random.randint', return_value=4)
     mocker.patch('rich.prompt.Prompt.ask', side_effect=rich_prompt_ask)
+
+    if sys.version_info >= (3, 10):
+        mocker.patch('pydantic_ai.mcp.MCPServerSSE', return_value=MockMCPServer())
+        mocker.patch('mcp.server.fastmcp.FastMCP')
 
     env.set('OPENAI_API_KEY', 'testing')
     env.set('GEMINI_API_KEY', 'testing')
@@ -105,6 +111,8 @@ def test_docs_examples(
         examples = [{'request': f'sql prompt {i}', 'sql': f'SELECT {i}'} for i in range(15)]
         with (tmp_path / 'examples.json').open('w') as f:
             json.dump(examples, f)
+    elif opt_title in {'ai_q_and_a_run.py', 'count_down_from_persistence.py'}:
+        os.chdir(tmp_path)
 
     ruff_ignore: list[str] = ['D', 'Q001']
     # `from bank_database import DatabaseConn` wrongly sorted in imports
@@ -178,7 +186,22 @@ def rich_prompt_ask(prompt: str, *_args: Any, **_kwargs: Any) -> str:
         raise ValueError(f'Unexpected prompt: {prompt}')
 
 
+class MockMCPServer:
+    is_running = True
+
+    async def __aenter__(self) -> MockMCPServer:
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        pass
+
+    @staticmethod
+    async def list_tools() -> list[None]:
+        return []
+
+
 text_responses: dict[str, str | ToolCallPart] = {
+    'Can you convert 30 degrees celsius to fahrenheit?': '30 degrees Celsius is equal to 86 degrees Fahrenheit.',
     'What is the weather like in West London and in Wiltshire?': (
         'The weather in West London is raining, while in Wiltshire it is sunny.'
     ),
@@ -186,6 +209,7 @@ text_responses: dict[str, str | ToolCallPart] = {
         tool_name='weather_forecast', args={'location': 'Paris', 'forecast_date': '2030-01-01'}, tool_call_id='0001'
     ),
     'Tell me a joke.': 'Did you hear about the toothpaste scandal? They called it Colgate.',
+    'Tell me a different joke.': 'No.',
     'Explain?': 'This is an excellent joke invented by Samuel Colvin, it needs no explanation.',
     'What is the capital of France?': 'Paris',
     'What is the capital of Italy?': 'Rome',

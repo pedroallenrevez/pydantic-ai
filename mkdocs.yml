@@ -28,6 +28,8 @@ nav:
       - multi-agent-applications.md
       - graph.md
       - input.md
+      - mcp_servers.md
+      - cli.md
   - Examples:
       - examples/index.md
       - examples/pydantic-model.md
@@ -53,6 +55,7 @@ nav:
       - api/models/base.md
       - api/models/openai.md
       - api/models/anthropic.md
+      - api/models/bedrock.md
       - api/models/cohere.md
       - api/models/gemini.md
       - api/models/vertexai.md
@@ -61,9 +64,11 @@ nav:
       - api/models/test.md
       - api/models/function.md
       - api/models/fallback.md
+      - api/providers.md
+      - api/mcp.md
       - api/pydantic_graph/graph.md
       - api/pydantic_graph/nodes.md
-      - api/pydantic_graph/state.md
+      - api/pydantic_graph/persistence.md
       - api/pydantic_graph/mermaid.md
       - api/pydantic_graph/exceptions.md
 

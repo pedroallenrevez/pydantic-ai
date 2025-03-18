@@ -9,13 +9,16 @@ from datetime import datetime, timezone
 from typing import Literal, Union, cast, overload
 
 from httpx import AsyncClient as AsyncHTTPClient
-from typing_extensions import assert_never
+from typing_extensions import assert_never, deprecated
+
+from pydantic_ai.providers import Provider, infer_provider
 
 from .. import ModelHTTPError, UnexpectedModelBehavior, _utils, usage
 from .._utils import guard_tool_call_id as _guard_tool_call_id
 from ..messages import (
     AudioUrl,
     BinaryContent,
+    DocumentUrl,
     ImageUrl,
     ModelMessage,
     ModelRequest,
@@ -96,18 +99,44 @@ class OpenAIModel(Model):
     system_prompt_role: OpenAISystemPromptRole | None = field(default=None)
 
     _model_name: OpenAIModelName = field(repr=False)
-    _system: str | None = field(repr=False)
+    _system: str = field(repr=False)
 
+    @overload
     def __init__(
         self,
         model_name: OpenAIModelName,
         *,
+        provider: Literal['openai', 'deepseek', 'azure'] | Provider[AsyncOpenAI] = 'openai',
+        system_prompt_role: OpenAISystemPromptRole | None = None,
+        system: str = 'openai',
+    ) -> None: ...
+
+    @deprecated('Use the `provider` parameter instead of `base_url`, `api_key`, `openai_client` and `http_client`.')
+    @overload
+    def __init__(
+        self,
+        model_name: OpenAIModelName,
+        *,
+        provider: None = None,
         base_url: str | None = None,
         api_key: str | None = None,
         openai_client: AsyncOpenAI | None = None,
         http_client: AsyncHTTPClient | None = None,
         system_prompt_role: OpenAISystemPromptRole | None = None,
-        system: str | None = 'openai',
+        system: str = 'openai',
+    ) -> None: ...
+
+    def __init__(
+        self,
+        model_name: OpenAIModelName,
+        *,
+        provider: Literal['openai', 'deepseek', 'azure'] | Provider[AsyncOpenAI] | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        openai_client: AsyncOpenAI | None = None,
+        http_client: AsyncHTTPClient | None = None,
+        system_prompt_role: OpenAISystemPromptRole | None = None,
+        system: str = 'openai',
     ):
         """Initialize an OpenAI model.
 
@@ -115,6 +144,7 @@ class OpenAIModel(Model):
             model_name: The name of the OpenAI model to use. List of model names available
                 [here](https://github.com/openai/openai-python/blob/v1.54.3/src/openai/types/chat_model.py#L7)
                 (Unfortunately, despite being ask to do so, OpenAI do not provide `.inv` files for their API).
+            provider: The provider to use. Defaults to `'openai'`.
             base_url: The base url for the OpenAI requests. If not provided, the `OPENAI_BASE_URL` environment variable
                 will be used if available. Otherwise, defaults to OpenAI's base url.
             api_key: The API key to use for authentication, if not provided, the `OPENAI_API_KEY` environment variable
@@ -129,22 +159,37 @@ class OpenAIModel(Model):
                 customize the `base_url` and `api_key` to use a different provider.
         """
         self._model_name = model_name
-        # This is a workaround for the OpenAI client requiring an API key, whilst locally served,
-        # openai compatible models do not always need an API key, but a placeholder (non-empty) key is required.
-        if api_key is None and 'OPENAI_API_KEY' not in os.environ and base_url is not None and openai_client is None:
-            api_key = 'api-key-not-set'
 
-        if openai_client is not None:
-            assert http_client is None, 'Cannot provide both `openai_client` and `http_client`'
-            assert base_url is None, 'Cannot provide both `openai_client` and `base_url`'
-            assert api_key is None, 'Cannot provide both `openai_client` and `api_key`'
-            self.client = openai_client
-        elif http_client is not None:
-            self.client = AsyncOpenAI(base_url=base_url, api_key=api_key, http_client=http_client)
-        else:
-            self.client = AsyncOpenAI(base_url=base_url, api_key=api_key, http_client=cached_async_http_client())
+        if provider is not None:
+            if isinstance(provider, str):
+                provider = infer_provider(provider)
+            self.client = provider.client
+        else:  # pragma: no cover
+            # This is a workaround for the OpenAI client requiring an API key, whilst locally served,
+            # openai compatible models do not always need an API key, but a placeholder (non-empty) key is required.
+            if (
+                api_key is None
+                and 'OPENAI_API_KEY' not in os.environ
+                and base_url is not None
+                and openai_client is None
+            ):
+                api_key = 'api-key-not-set'
+
+            if openai_client is not None:
+                assert http_client is None, 'Cannot provide both `openai_client` and `http_client`'
+                assert base_url is None, 'Cannot provide both `openai_client` and `base_url`'
+                assert api_key is None, 'Cannot provide both `openai_client` and `api_key`'
+                self.client = openai_client
+            elif http_client is not None:
+                self.client = AsyncOpenAI(base_url=base_url, api_key=api_key, http_client=http_client)
+            else:
+                self.client = AsyncOpenAI(base_url=base_url, api_key=api_key, http_client=cached_async_http_client())
         self.system_prompt_role = system_prompt_role
         self._system = system
+
+    @property
+    def base_url(self) -> str:
+        return str(self.client.base_url)
 
     async def request(
         self,
@@ -178,7 +223,7 @@ class OpenAIModel(Model):
         return self._model_name
 
     @property
-    def system(self) -> str | None:
+    def system(self) -> str:
         """The system / model provider."""
         return self._system
 
@@ -373,7 +418,8 @@ class OpenAIModel(Model):
                         image_url = ImageURL(url=f'data:{item.media_type};base64,{base64_encoded}')
                         content.append(ChatCompletionContentPartImageParam(image_url=image_url, type='image_url'))
                     elif item.is_audio:
-                        audio = InputAudio(data=base64_encoded, format=item.audio_format)
+                        assert item.format in ('wav', 'mp3')
+                        audio = InputAudio(data=base64_encoded, format=item.format)
                         content.append(ChatCompletionContentPartInputAudioParam(input_audio=audio, type='input_audio'))
                     else:  # pragma: no cover
                         raise RuntimeError(f'Unsupported binary content type: {item.media_type}')
@@ -384,6 +430,25 @@ class OpenAIModel(Model):
                     base64_encoded = base64.b64encode(response.content).decode('utf-8')
                     audio = InputAudio(data=base64_encoded, format=response.headers.get('content-type'))
                     content.append(ChatCompletionContentPartInputAudioParam(input_audio=audio, type='input_audio'))
+                elif isinstance(item, DocumentUrl):  # pragma: no cover
+                    raise NotImplementedError('DocumentUrl is not supported for OpenAI')
+                    # The following implementation should have worked, but it seems we have the following error:
+                    # pydantic_ai.exceptions.ModelHTTPError: status_code: 400, model_name: gpt-4o, body:
+                    # {
+                    #   'message': "Unknown parameter: 'messages[1].content[1].file.data'.",
+                    #   'type': 'invalid_request_error',
+                    #   'param': 'messages[1].content[1].file.data',
+                    #   'code': 'unknown_parameter'
+                    # }
+                    #
+                    # client = cached_async_http_client()
+                    # response = await client.get(item.url)
+                    # response.raise_for_status()
+                    # base64_encoded = base64.b64encode(response.content).decode('utf-8')
+                    # media_type = response.headers.get('content-type').split(';')[0]
+                    # file_data = f'data:{media_type};base64,{base64_encoded}'
+                    # file = File(file={'file_data': file_data, 'file_name': item.url, 'file_id': item.url}, type='file')
+                    # content.append(file)
                 else:
                     assert_never(item)
         return chat.ChatCompletionUserMessageParam(role='user', content=content)

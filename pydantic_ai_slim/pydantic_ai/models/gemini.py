@@ -8,17 +8,20 @@ from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Annotated, Any, Literal, Protocol, Union, cast
+from typing import Annotated, Any, Literal, Protocol, Union, cast, overload
 from uuid import uuid4
 
 import pydantic
 from httpx import USE_CLIENT_DEFAULT, AsyncClient as AsyncHTTPClient, Response as HTTPResponse
-from typing_extensions import NotRequired, TypedDict, assert_never
+from typing_extensions import NotRequired, TypedDict, assert_never, deprecated
+
+from pydantic_ai.providers import Provider, infer_provider
 
 from .. import ModelHTTPError, UnexpectedModelBehavior, UserError, _utils, usage
 from ..messages import (
     AudioUrl,
     BinaryContent,
+    DocumentUrl,
     ImageUrl,
     ModelMessage,
     ModelRequest,
@@ -82,17 +85,39 @@ class GeminiModel(Model):
     Apart from `__init__`, all methods are private or match those of the base class.
     """
 
-    http_client: AsyncHTTPClient = field(repr=False)
+    client: AsyncHTTPClient = field(repr=False)
 
     _model_name: GeminiModelName = field(repr=False)
+    _provider: Literal['google-gla', 'google-vertex'] | Provider[AsyncHTTPClient] | None = field(repr=False)
     _auth: AuthProtocol | None = field(repr=False)
     _url: str | None = field(repr=False)
-    _system: str | None = field(default='google-gla', repr=False)
+    _system: str = field(default='gemini', repr=False)
+
+    @overload
+    def __init__(
+        self,
+        model_name: GeminiModelName,
+        *,
+        provider: Literal['google-gla', 'google-vertex'] | Provider[AsyncHTTPClient] = 'google-gla',
+    ) -> None: ...
+
+    @deprecated('Use the `provider` argument instead of the `api_key`, `http_client`, and `url_template` arguments.')
+    @overload
+    def __init__(
+        self,
+        model_name: GeminiModelName,
+        *,
+        provider: None = None,
+        api_key: str | None = None,
+        http_client: AsyncHTTPClient | None = None,
+        url_template: str = 'https://generativelanguage.googleapis.com/v1beta/models/{model}:',
+    ) -> None: ...
 
     def __init__(
         self,
         model_name: GeminiModelName,
         *,
+        provider: Literal['google-gla', 'google-vertex'] | Provider[AsyncHTTPClient] | None = None,
         api_key: str | None = None,
         http_client: AsyncHTTPClient | None = None,
         url_template: str = 'https://generativelanguage.googleapis.com/v1beta/models/{model}:',
@@ -101,6 +126,7 @@ class GeminiModel(Model):
 
         Args:
             model_name: The name of the model to use.
+            provider: The provider to use for the model.
             api_key: The API key to use for authentication, if not provided, the `GEMINI_API_KEY` environment variable
                 will be used if available.
             http_client: An existing `httpx.AsyncClient` to use for making HTTP requests.
@@ -109,14 +135,23 @@ class GeminiModel(Model):
                 `model` is substituted with the model name, and `function` is added to the end of the URL.
         """
         self._model_name = model_name
-        if api_key is None:
-            if env_api_key := os.getenv('GEMINI_API_KEY'):
-                api_key = env_api_key
-            else:
-                raise UserError('API key must be provided or set in the GEMINI_API_KEY environment variable')
-        self.http_client = http_client or cached_async_http_client()
-        self._auth = ApiKeyAuth(api_key)
-        self._url = url_template.format(model=model_name)
+        self._provider = provider
+
+        if provider is not None:
+            if isinstance(provider, str):
+                provider = infer_provider(provider)
+            self._system = provider.name
+            self.client = provider.client
+            self._url = str(self.client.base_url)
+        else:
+            if api_key is None:
+                if env_api_key := os.getenv('GEMINI_API_KEY'):
+                    api_key = env_api_key
+                else:
+                    raise UserError('API key must be provided or set in the GEMINI_API_KEY environment variable')
+            self.client = http_client or cached_async_http_client()
+            self._auth = ApiKeyAuth(api_key)
+            self._url = url_template.format(model=model_name)
 
     @property
     def auth(self) -> AuthProtocol:
@@ -124,7 +159,7 @@ class GeminiModel(Model):
         return self._auth
 
     @property
-    def url(self) -> str:
+    def base_url(self) -> str:
         assert self._url is not None, 'URL not initialized'
         return self._url
 
@@ -160,7 +195,7 @@ class GeminiModel(Model):
         return self._model_name
 
     @property
-    def system(self) -> str | None:
+    def system(self) -> str:
         """The system / model provider."""
         return self._system
 
@@ -217,17 +252,19 @@ class GeminiModel(Model):
         if generation_config:
             request_data['generation_config'] = generation_config
 
-        url = self.url + ('streamGenerateContent' if streamed else 'generateContent')
-
         headers = {
             'Content-Type': 'application/json',
             'User-Agent': get_user_agent(),
-            **await self.auth.headers(),
         }
+        if self._provider is None:  # pragma: no cover
+            url = self.base_url + ('streamGenerateContent' if streamed else 'generateContent')
+            headers.update(await self.auth.headers())
+        else:
+            url = f'/{self._model_name}:{"streamGenerateContent" if streamed else "generateContent"}'
 
         request_json = _gemini_request_ta.dump_json(request_data, by_alias=True)
 
-        async with self.http_client.stream(
+        async with self.client.stream(
             'POST',
             url,
             content=request_json,
@@ -324,22 +361,15 @@ class GeminiModel(Model):
                     content.append(
                         _GeminiInlineDataPart(inline_data={'data': base64_encoded, 'mime_type': item.media_type})
                     )
-                elif isinstance(item, (AudioUrl, ImageUrl)):
-                    try:
-                        content.append(
-                            _GeminiFileDataPart(file_data={'file_uri': item.url, 'mime_type': item.media_type})
-                        )
-                    except ValueError:
-                        # Download the file if can't find the mime type.
-                        client = cached_async_http_client()
-                        response = await client.get(item.url, follow_redirects=True)
-                        response.raise_for_status()
-                        base64_encoded = base64.b64encode(response.content).decode('utf-8')
-                        content.append(
-                            _GeminiInlineDataPart(
-                                inline_data={'data': base64_encoded, 'mime_type': response.headers['Content-Type']}
-                            )
-                        )
+                elif isinstance(item, (AudioUrl, ImageUrl, DocumentUrl)):
+                    client = cached_async_http_client()
+                    response = await client.get(item.url, follow_redirects=True)
+                    response.raise_for_status()
+                    mime_type = response.headers['Content-Type'].split(';')[0]
+                    inline_data = _GeminiInlineDataPart(
+                        inline_data={'data': base64.b64encode(response.content).decode('utf-8'), 'mime_type': mime_type}
+                    )
+                    content.append(inline_data)
                 else:
                     assert_never(item)
         return content
